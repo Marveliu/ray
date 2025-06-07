@@ -12,22 +12,32 @@ from typing import List, Optional, Tuple, TypedDict, Union
 
 from opencensus.stats import stats as stats_module
 from prometheus_client.core import REGISTRY
+from opentelemetry.proto.collector.metrics.v1 import metrics_service_pb2
+from grpc.aio import ServicerContext
+
 
 import ray
 import ray._private.prometheus_exporter as prometheus_exporter
-import ray._private.services
 import ray.dashboard.modules.reporter.reporter_consts as reporter_consts
 import ray.dashboard.utils as dashboard_utils
-from ray._common.utils import get_or_create_event_loop
+from ray._common.utils import (
+    get_or_create_event_loop,
+    get_system_memory,
+    get_user_temp_dir,
+)
 from ray._private import utils
 from ray._private.metrics_agent import Gauge, MetricsAgent, Record
 from ray._private.ray_constants import (
     DEBUG_AUTOSCALING_STATUS,
     RAY_EXPERIMENTAL_ENABLE_OPEN_TELEMETRY_ON_AGENT,
+    RAY_EXPERIMENTAL_ENABLE_OPEN_TELEMETRY_ON_CORE,
     env_integer,
 )
-from ray._raylet import WorkerID, GCS_PID_KEY
-from ray.core.generated import reporter_pb2, reporter_pb2_grpc
+from ray._private.telemetry.open_telemetry_metric_recorder import (
+    OpenTelemetryMetricRecorder,
+)
+from ray._raylet import GCS_PID_KEY, WorkerID
+from ray.core.generated import metrics_service_pb2_grpc, reporter_pb2, reporter_pb2_grpc
 from ray.dashboard import k8s_utils
 from ray.dashboard.consts import (
     CLUSTER_TAG_KEYS,
@@ -36,13 +46,10 @@ from ray.dashboard.consts import (
     GPU_TAG_KEYS,
     NODE_TAG_KEYS,
 )
+from ray.dashboard.modules.reporter.gpu_profile_manager import GpuProfilingManager
 from ray.dashboard.modules.reporter.profile_manager import (
     CpuProfilingManager,
     MemoryProfilingManager,
-)
-from ray.dashboard.modules.reporter.gpu_profile_manager import GpuProfilingManager
-from ray._private.telemetry.open_telemetry_metric_recorder import (
-    OpenTelemetryMetricRecorder,
 )
 
 import psutil
@@ -342,7 +349,9 @@ class GpuUtilizationInfo(TypedDict):
 
 
 class ReporterAgent(
-    dashboard_utils.DashboardAgentModule, reporter_pb2_grpc.ReporterServiceServicer
+    dashboard_utils.DashboardAgentModule,
+    reporter_pb2_grpc.ReporterServiceServicer,
+    metrics_service_pb2_grpc.MetricsServiceServicer,
 ):
     """A monitor process for monitoring Ray nodes.
 
@@ -498,6 +507,29 @@ class ReporterAgent(
             logger.error(traceback.format_exc())
         return reporter_pb2.ReportOCMetricsReply()
 
+    async def Export(
+        self,
+        request: metrics_service_pb2.ExportMetricsServiceRequest,
+        context: ServicerContext,
+    ) -> metrics_service_pb2.ExportMetricsServiceResponse:
+        for resource_metrics in request.resource_metrics:
+            for scope_metrics in resource_metrics.scope_metrics:
+                for metric in scope_metrics.metrics:
+                    self._open_telemetry_metric_recorder.register_gauge_metric(
+                        metric.name, metric.description or ""
+                    )
+                    for data_point in metric.gauge.data_points:
+                        self._open_telemetry_metric_recorder.set_metric_value(
+                            metric.name,
+                            {
+                                tag.key: tag.value.string_value
+                                for tag in data_point.attributes
+                            },
+                            data_point.as_double,
+                        )
+
+        return metrics_service_pb2.ExportMetricsServiceResponse()
+
     @staticmethod
     def _get_cpu_percent(in_k8s: bool):
         if in_k8s:
@@ -602,7 +634,7 @@ class ReporterAgent(
 
     @staticmethod
     def _get_mem_usage():
-        total = utils.get_system_memory()
+        total = get_system_memory()
         used = utils.get_used_memory()
         available = total - used
         percent = round(used / total, 3) * 100
@@ -619,7 +651,7 @@ class ReporterAgent(
             root = psutil.disk_partitions()[0].mountpoint
         else:
             root = os.sep
-        tmp = utils.get_user_temp_dir()
+        tmp = get_user_temp_dir()
         return {
             "/": psutil.disk_usage(root),
             tmp: psutil.disk_usage(tmp),
@@ -1358,6 +1390,10 @@ class ReporterAgent(
     async def run(self, server):
         if server:
             reporter_pb2_grpc.add_ReporterServiceServicer_to_server(self, server)
+            if RAY_EXPERIMENTAL_ENABLE_OPEN_TELEMETRY_ON_CORE:
+                metrics_service_pb2_grpc.add_MetricsServiceServicer_to_server(
+                    self, server
+                )
 
         await self._run_loop()
 
