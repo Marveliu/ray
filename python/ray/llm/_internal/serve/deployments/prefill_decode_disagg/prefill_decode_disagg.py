@@ -2,10 +2,10 @@
 """
 import asyncio
 import logging
-from typing import AsyncGenerator, Union
 import uuid
+from typing import Any, AsyncGenerator, Dict, Union
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from vllm.config import KVTransferConfig
 
 from ray import serve
@@ -36,6 +36,12 @@ class PDServingArgs(BaseModel):
 
     prefill_config: Union[str, LLMConfig]
     decode_config: Union[str, LLMConfig]
+    proxy_deployment_config: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="""
+            The Ray @server.deployment options for the proxy server.
+        """,
+    )
 
     def parse_args(self) -> "PDServingArgs":
         """Converts this LLMServingArgs object into an DeployArgs object."""
@@ -52,6 +58,7 @@ class PDServingArgs(BaseModel):
             # Parse string file path into LLMConfig
             prefill_config=parse_configs_and_cast_type(self.prefill_config),
             decode_config=parse_configs_and_cast_type(self.decode_config),
+            proxy_deployment_config=self.proxy_deployment_config,
         )
 
 
@@ -136,14 +143,17 @@ class PDProxyServer(LLMServer):
         prefill_response = await ResponsePostprocessor.merge_stream(
             prefill_response_gen
         )
+
         if prefill_response.error:
             logger.error(f"Prefill server returned error: {prefill_response.error}")
             yield prefill_response
             return
 
-        prompt.parameters[KV_TRANSFER_PARAMS_KEY] = prefill_response.metadata[
-            KV_TRANSFER_PARAMS_KEY
-        ]
+        kv_transfer_params = prefill_response.metadata[KV_TRANSFER_PARAMS_KEY]
+        logger.debug(
+            f"Prefill metadata[{KV_TRANSFER_PARAMS_KEY}]: {kv_transfer_params}"
+        )
+        prompt.parameters[KV_TRANSFER_PARAMS_KEY] = kv_transfer_params
 
         async for chunk in self.decode_server.options(stream=True)._predict.remote(
             request_id=request_id, prompt=prompt, stream=stream
@@ -190,12 +200,16 @@ def build_app(pd_serving_args: dict) -> Application:
         pd_config.decode_config, name_prefix="Decode:"
     )
 
-    proxy_server_deployment = PDProxyServer.as_deployment().bind(
-        llm_config=LLMConfig(
-            model_loading_config=ModelLoadingConfig(model_id=model_id)
-        ),
-        prefill_server=prefill_deployment,
-        decode_server=decode_deployment,
+    proxy_server_deployment = (
+        PDProxyServer.as_deployment()
+        .options(**pd_config.proxy_deployment_config)
+        .bind(
+            llm_config=LLMConfig(
+                model_loading_config=ModelLoadingConfig(model_id=model_id)
+            ),
+            prefill_server=prefill_deployment,
+            decode_server=decode_deployment,
+        )
     )
 
     return LLMRouter.as_deployment().bind(llm_deployments=[proxy_server_deployment])
